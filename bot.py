@@ -8,7 +8,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "ВАШ_ТОКЕН_БОТА")
+BOT_TOKEN = os.getenv("8750998872:AAHfrgtpmVWueBaid4iZ9jZERe0BfUnN9v8")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
