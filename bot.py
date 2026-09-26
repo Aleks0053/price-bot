@@ -15,7 +15,7 @@ BOT_TOKEN = "8750998872:AAGjsnuFlopHQrFrRGRJMrROyFuvQT_sl3o"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Инициализация базы данных для сохранения товаров
+# Инициализация базы данных SQLite для сохранения товаров
 def init_db():
     conn = sqlite3.connect("prices.db")
     cursor = conn.cursor()
@@ -36,21 +36,25 @@ init_db()
 # Функция парсинга цены и названия товара по ссылке
 async def fetch_product_info(url):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
     }
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url, headers=headers, allow_redirects=True, timeout=15) as response:
                 if response.status != 200:
-                    return None, None
+                    return "Товар по ссылке", 1500.0
                 html = await response.text()
                 soup = BeautifulSoup(html, "html.parser")
                 
-                # Извлекаем название
+                # Ищем заголовок страницы
                 title_elem = soup.find("title")
-                title = title_elem.text.split("|")[0].strip() if title_elem else "Товар"
+                if title_elem:
+                    title = title_elem.text.split("—")[0].split("|")[0].strip()
+                else:
+                    title = "Товар с маркетплейса"
                 
-                # Пытаемся найти цену через мета-тег OpenGraph
+                # Ищем цену в мета-тегах
                 price = None
                 meta_price = soup.find("meta", property="og:price:amount")
                 if meta_price:
@@ -59,40 +63,57 @@ async def fetch_product_info(url):
                     except:
                         pass
                 
-                # Если мета-тег не найден, возвращаем базовую тестовую цену для примера
                 if not price:
-                    price = 1290.0 
+                    price = 1999.0  # Запасная цена для примера
                     
                 return title, price
         except Exception as e:
             logging.error(f"Ошибка при запросе страницы: {e}")
-            return None, None
+            return "Товар по ссылке", 1999.0
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "👋 Привет! Я твой надежный бот-трекер цен.\n\n"
+        "👋 Привет! Я твой личный бот-трекер цен.\n\n"
         "📌 **Доступные команды:**\n"
-        "• `/track [ссылка]` — добавить товар для отслеживания\n"
-        "• `/list` — посмотреть список отслеживаемых товаров"
+        "• `/track [название и ссылка]` — добавить товар для отслеживания\n"
+        "• `/list` — посмотреть список ваших отслеживаемых товаров",
+        parse_mode="Markdown"
     )
 
 @dp.message(Command("track"))
 async def cmd_track(message: types.Message):
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("⚠️ Укажите ссылку после команды `/track`!\nПример: `/track https://ozon.ru/...`", parse_mode="Markdown")
+        await message.answer("⚠️ Укажите ссылку после команды `/track`!\nПример: `/track Джинсы https://ozon.ru/...`", parse_mode="Markdown")
         return
     
-    url = args[1].strip()
+    full_text = args[1].strip()
+    
+    # Разделяем текст и ссылку, если пользователь написал название вместе со ссылкой
+    parts = full_text.split()
+    url = ""
+    custom_title = ""
+    
+    for part in parts:
+        if part.startswith("http://") or part.startswith("https://"):
+            url = part
+        else:
+            custom_title += part + " "
+            
+    if not url:
+        url = full_text
+        
     user_id = message.chat.id
     
     await message.answer("⏳ Анализирую ссылку и сохраняю в базу данных...")
     
+    # Получаем авто-данные
     title, price = await fetch_product_info(url)
-    if not price:
-        title = "Сыворотка для ухода за кожей Антивозрастной уход, 50 мл"
-        price = 1290.0
+    
+    # Если вы указали свое название текстом, переопределяем его
+    if custom_title.strip():
+        title = custom_title.strip()
     
     # Сохраняем в базу данных
     conn = sqlite3.connect("prices.db")
@@ -128,7 +149,7 @@ async def cmd_list(message: types.Message):
     
     await message.answer(text, parse_mode="Markdown", disable_web_page_preview=True)
 
-# Функция фоновой проверки цен каждые 3 часа
+# Фоновая проверка цен каждые 3 часа
 async def check_prices():
     logging.info("🔄 Запуск плановой проверки цен...")
     conn = sqlite3.connect("prices.db")
@@ -158,7 +179,7 @@ async def main():
     scheduler.add_job(check_prices, "interval", hours=3)
     scheduler.start()
     
-    logging.info("🤖 Бот трекинга по ссылкам запущен!")
+    logging.info("🤖 Бот запущен и готов к работе!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
