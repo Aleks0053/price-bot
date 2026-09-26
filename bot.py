@@ -10,12 +10,11 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = "8750998872:AAGjsnuFlopHQrFrRGRJMrROyFuvQT_sl3o"
+BOT_TOKEN = "8750998872:AAHfrgptmWueBaid4i2Z9jZEREObfU"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Инициализация базы данных SQLite для сохранения товаров
 def init_db():
     conn = sqlite3.connect("prices.db")
     cursor = conn.cursor()
@@ -33,7 +32,6 @@ def init_db():
 
 init_db()
 
-# Функция парсинга цены и названия товара по ссылке
 async def fetch_product_info(url):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -43,18 +41,13 @@ async def fetch_product_info(url):
         try:
             async with session.get(url, headers=headers, allow_redirects=True, timeout=15) as response:
                 if response.status != 200:
-                    return "Товар по ссылке", 1500.0
+                    return "Товар с маркетплейса", 1500.0
                 html = await response.text()
                 soup = BeautifulSoup(html, "html.parser")
                 
-                # Ищем заголовок страницы
                 title_elem = soup.find("title")
-                if title_elem:
-                    title = title_elem.text.split("—")[0].split("|")[0].strip()
-                else:
-                    title = "Товар с маркетплейса"
+                title = title_elem.text.split("—")[0].split("|")[0].strip() if title_elem else "Товар"
                 
-                # Ищем цену в мета-тегах
                 price = None
                 meta_price = soup.find("meta", property="og:price:amount")
                 if meta_price:
@@ -64,20 +57,20 @@ async def fetch_product_info(url):
                         pass
                 
                 if not price:
-                    price = 1999.0  # Запасная цена для примера
+                    price = 1999.0
                     
                 return title, price
         except Exception as e:
             logging.error(f"Ошибка при запросе страницы: {e}")
-            return "Товар по ссылке", 1999.0
+            return "Товар с маркетплейса", 1999.0
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "👋 Привет! Я твой личный бот-трекер цен.\n\n"
-        "📌 **Доступные команды:**\n"
-        "• `/track [название и ссылка]` — добавить товар для отслеживания\n"
-        "• `/list` — посмотреть список ваших отслеживаемых товаров",
+        "👋 Привет! Я твой бот-трекер цен.\n\n"
+        "📌 **Команды:**\n"
+        "• `/track [название и ссылка]` — добавить товар\n"
+        "• `/list` — список товаров",
         parse_mode="Markdown"
     )
 
@@ -89,8 +82,6 @@ async def cmd_track(message: types.Message):
         return
     
     full_text = args[1].strip()
-    
-    # Разделяем текст и ссылку, если пользователь написал название вместе со ссылкой
     parts = full_text.split()
     url = ""
     custom_title = ""
@@ -105,17 +96,12 @@ async def cmd_track(message: types.Message):
         url = full_text
         
     user_id = message.chat.id
+    await message.answer("⏳ Анализирую ссылку и сохраняю...")
     
-    await message.answer("⏳ Анализирую ссылку и сохраняю в базу данных...")
-    
-    # Получаем авто-данные
     title, price = await fetch_product_info(url)
-    
-    # Если вы указали свое название текстом, переопределяем его
     if custom_title.strip():
         title = custom_title.strip()
     
-    # Сохраняем в базу данных
     conn = sqlite3.connect("prices.db")
     cursor = conn.cursor()
     cursor.execute("INSERT INTO tracked (user_id, url, title, price) VALUES (?, ?, ?, ?)", (user_id, url, title, price))
@@ -123,10 +109,9 @@ async def cmd_track(message: types.Message):
     conn.close()
     
     await message.answer(
-        f"✅ **Товар успешно добавлен в трекер!**\n\n"
+        f"✅ **Товар добавлен в трекер!**\n\n"
         f"📦 **{title}**\n"
-        f"💰 **Текущая цена:** {price} руб.\n\n"
-        f"Я буду проверять цену каждые 3 часа и пришлю уведомление, если она снизится!",
+        f"💰 **Цена:** {price} руб.",
         parse_mode="Markdown"
     )
 
@@ -145,13 +130,11 @@ async def cmd_list(message: types.Message):
     
     text = "📋 **Ваши отслеживаемые товары:**\n\n"
     for i, (title, price, url) in enumerate(rows, 1):
-        text += f"{i}. **{title}**\n💰 {price} руб.\n🔗 [Ссылка на товар]({url})\n\n"
+        text += f"{i}. **{title}**\n💰 {price} руб.\n🔗 [Ссылка]({url})\n\n"
     
     await message.answer(text, parse_mode="Markdown", disable_web_page_preview=True)
 
-# Фоновая проверка цен каждые 3 часа
 async def check_prices():
-    logging.info("🔄 Запуск плановой проверки цен...")
     conn = sqlite3.connect("prices.db")
     cursor = conn.cursor()
     cursor.execute("SELECT id, user_id, url, title, price FROM tracked")
@@ -168,7 +151,7 @@ async def check_prices():
                 f"📦 **{old_title}**\n"
                 f"📉 Было: {old_price} руб.\n"
                 f"💰 Стало: **{new_price} руб.**\n"
-                f"🔗 [Перейти к товару]({url})",
+                f"🔗 [Перейти]({url})",
                 parse_mode="Markdown"
             )
         await asyncio.sleep(3)
@@ -178,8 +161,6 @@ async def main():
     scheduler = AsyncIOScheduler()
     scheduler.add_job(check_prices, "interval", hours=3)
     scheduler.start()
-    
-    logging.info("🤖 Бот запущен и готов к работе!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
