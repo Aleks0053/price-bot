@@ -8,7 +8,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = "8750998872:AAHfrgtpmVWueBaid4iZ9jZERe0BfUnN9v8"
+# Ваш токен бота
+BOT_TOKEN = "8750998872:AAHfrgptmWueBaid4i2Z9jZEREObfU"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -24,7 +25,7 @@ async def cmd_start(message: types.Message):
     global ADMIN_CHAT_ID
     ADMIN_CHAT_ID = message.chat.id
     await message.answer(
-        "👋 Привет! Бот переведен на режим **автоматического поиска скидок**.\n\n"
+        "👋 Привет! Бот успешно запущен и переведен на режим **автоматического поиска скидок**.\n\n"
         "🔍 Я сканирую каталог по ключевым словам и буду присылать выгодные предложения 24/7!"
     )
 
@@ -50,25 +51,19 @@ async def search_and_notify():
     async with aiohttp.ClientSession() as session:
         for query in SEARCH_QUERIES:
             try:
-                # Пример запроса к открытым поисковым API / выдаче
-                # (В реальных проектах здесь подставляется URL поискового API площадки)
                 search_url = f"https://sapi.ozon.ru/searchgw/v2/search?text={query}&page=1"
                 
                 async with session.get(search_url, headers=headers, timeout=10) as response:
                     if response.status == 200:
                         data = await response.json()
-                        
-                        # Обработка результатов поиска (пример структуры ответа)
-                        # Ищем товары и проверяем их цены
                         items = data.get("result", {}).get("items", [])
                         
                         if items:
-                            top_item = items[0] # Берем первый попавшийся товар как пример
+                            top_item = items[0]
                             title = top_item.get("title", "Товар")
                             price = top_item.get("price", {}).get("price", 0)
                             link = top_item.get("link", "https://ozon.ru")
                             
-                            # Условная логика: если нашли интересную цену — шлем уведомление
                             alert_text = (
                                 f"🔥 **Найдено предложение по запросу:** _{query}_\n\n"
                                 f"📦 **{title}**\n"
@@ -80,12 +75,10 @@ async def search_and_notify():
             except Exception as e:
                 logging.error(f"Ошибка при поиске по запросу '{query}': {e}")
             
-            # Небольшая пауза между запросами, чтобы не нагружать сервер и избежать блокировок
             await asyncio.sleep(5)
 
 async def main():
     scheduler = AsyncIOScheduler()
-    # Запускаем поиск каждые 3 часа
     scheduler.add_job(search_and_notify, "interval", hours=3)
     scheduler.start()
     
