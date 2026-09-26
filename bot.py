@@ -98,9 +98,11 @@ async def cmd_track(message: types.Message):
     user_id = message.chat.id
     await message.answer("⏳ Анализирую ссылку и сохраняю...")
     
-    title, price = await fetch_product_info(url)
-    if custom_title.strip():
-        title = custom_title.strip()
+    # Пытаемся получить данные, но если пользователь написал свое название — используем его
+    scraped_title, price = await fetch_product_info(url)
+    
+    # Если вы написали название руками (как «Джинсы MkJeans»), берем его, иначе то, что спарсилось
+    title = custom_title.strip() if custom_title.strip() else scraped_title
     
     conn = sqlite3.connect("prices.db")
     cursor = conn.cursor()
