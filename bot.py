@@ -1,10 +1,12 @@
 import asyncio
 import logging
+import os
 import aiohttp
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiohttp import web
 
 logging.basicConfig(level=logging.INFO)
 
@@ -13,7 +15,7 @@ BOT_TOKEN = "8750998872:AAGjsnuFlopHQrFrRGRJMrROyFuvQT_sl3o"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Хранилище в оперативной памяти (надежно, не падает на Render)
+# Хранилище в оперативной памяти
 user_tracked_items = {}
 
 async def check_product_price(url):
@@ -75,7 +77,6 @@ async def cmd_track(message: types.Message):
     args_text = text_parts[1].strip()
     words = args_text.split()
     
-    # Ищем ссылку (начинается с http)
     url = ""
     url_index = -1
     for i, word in enumerate(words):
@@ -88,7 +89,6 @@ async def cmd_track(message: types.Message):
         await message.answer("⚠️ Обязательно укажите название, цену и ссылку в конце!")
         return
         
-    # Предпоследнее слово перед ссылкой — это цена
     price_str = words[url_index - 1].replace("руб.", "").replace("₽", "").strip()
     try:
         price = float(price_str.replace(",", "."))
@@ -96,7 +96,6 @@ async def cmd_track(message: types.Message):
         await message.answer(f"⚠️ Не удалось распознать цену (`{price_str}`). Убедитесь, что перед ссылкой идет число, например: `3402`", parse_mode="Markdown")
         return
         
-    # Всё, что до цены — это название товара
     title = " ".join(words[:url_index - 1])
     user_id = message.chat.id
     
@@ -162,11 +161,29 @@ async def scheduled_price_check():
                     logging.error(f"Ошибка уведомления: {e}")
             await asyncio.sleep(2)
 
+# Заглушка веб-сервера для Render, чтобы он не отключал бота
+async def handle(request):
+    return web.Response(text="Bot is running!")
+
+async def web_server():
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
 async def main():
     scheduler = AsyncIOScheduler()
     scheduler.add_job(scheduled_price_check, "interval", hours=3)
     scheduler.start()
-    await dp.start_polling(bot)
+    
+    # Запускаем и веб-сервер для Render, и самого бота параллельно
+    await asyncio.gather(
+        web_server(),
+        dp.start_polling(bot)
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
