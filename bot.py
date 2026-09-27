@@ -10,7 +10,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = "8750998872:AAHfrgptmWueBaid4i2Z9jZEREObfU"
+BOT_TOKEN = "8750998872:AAGjsnuFlopHQrFrRGRJMrROyFuvQT_sl3o"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -41,12 +41,9 @@ async def fetch_product_info(url):
         try:
             async with session.get(url, headers=headers, allow_redirects=True, timeout=15) as response:
                 if response.status != 200:
-                    return "Товар с маркетплейса", 1500.0
+                    return 1999.0
                 html = await response.text()
                 soup = BeautifulSoup(html, "html.parser")
-                
-                title_elem = soup.find("title")
-                title = title_elem.text.split("—")[0].split("|")[0].strip() if title_elem else "Товар"
                 
                 price = None
                 meta_price = soup.find("meta", property="og:price:amount")
@@ -56,63 +53,58 @@ async def fetch_product_info(url):
                     except:
                         pass
                 
-                if not price:
-                    price = 1999.0
-                    
-                return title, price
+                return price if price else 1999.0
         except Exception as e:
             logging.error(f"Ошибка при запросе страницы: {e}")
-            return "Товар с маркетплейса", 1999.0
+            return 1999.0
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "👋 Привет! Я твой бот-трекер цен.\n\n"
+        "👋 Привет! Бот готов к работе.\n\n"
         "📌 **Команды:**\n"
-        "• `/track [название и ссылка]` — добавить товар\n"
-        "• `/list` — список товаров",
+        "• `/track [Название] [Ссылка]` — добавить товар\n"
+        "• `/list` — список товаров\n"
+        "• `/clear` — удалить все отслеживаемые товары",
         parse_mode="Markdown"
     )
 
 @dp.message(Command("track"))
 async def cmd_track(message: types.Message):
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("⚠️ Укажите ссылку после команды `/track`!\nПример: `/track Джинсы https://ozon.ru/...`", parse_mode="Markdown")
+    text_parts = message.text.split(maxsplit=1)
+    if len(text_parts) < 2:
+        await message.answer("⚠️ Укажите название и ссылку!\nПример: `/track Джинсы https://ozon.ru/...`", parse_mode="Markdown")
         return
     
-    full_text = args[1].strip()
-    parts = full_text.split()
+    full_args = text_parts[1].strip()
     url = ""
-    custom_title = ""
+    title_words = []
     
-    for part in parts:
-        if part.startswith("http://") or part.startswith("https://"):
-            url = part
+    for word in full_args.split():
+        if word.startswith("http://") or word.startswith("https://"):
+            url = word
         else:
-            custom_title += part + " "
+            title_words.append(word)
             
     if not url:
-        url = full_text
+        await message.answer("⚠️ Вы забыли указать ссылку на товар!")
+        return
         
+    custom_title = " ".join(title_words) if title_words else "Товар с маркетплейса"
     user_id = message.chat.id
-    await message.answer("⏳ Анализирую ссылку и сохраняю...")
     
-    # Пытаемся получить данные, но если пользователь написал свое название — используем его
-    scraped_title, price = await fetch_product_info(url)
-    
-    # Если вы написали название руками (как «Джинсы MkJeans»), берем его, иначе то, что спарсилось
-    title = custom_title.strip() if custom_title.strip() else scraped_title
+    await message.answer("⏳ Получаю данные о товаре...")
+    price = await fetch_product_info(url)
     
     conn = sqlite3.connect("prices.db")
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO tracked (user_id, url, title, price) VALUES (?, ?, ?, ?)", (user_id, url, title, price))
+    cursor.execute("INSERT INTO tracked (user_id, url, title, price) VALUES (?, ?, ?, ?)", (user_id, url, custom_title, price))
     conn.commit()
     conn.close()
     
     await message.answer(
-        f"✅ **Товар добавлен в трекер!**\n\n"
-        f"📦 **{title}**\n"
+        f"✅ **Товар успешно добавлен!**\n\n"
+        f"📦 **Название:** {custom_title}\n"
         f"💰 **Цена:** {price} руб.",
         parse_mode="Markdown"
     )
@@ -136,6 +128,16 @@ async def cmd_list(message: types.Message):
     
     await message.answer(text, parse_mode="Markdown", disable_web_page_preview=True)
 
+@dp.message(Command("clear"))
+async def cmd_clear(message: types.Message):
+    user_id = message.chat.id
+    conn = sqlite3.connect("prices.db")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM tracked WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    await message.answer("🗑 Ваш список отслеживания полностью очищен!")
+
 async def check_prices():
     conn = sqlite3.connect("prices.db")
     cursor = conn.cursor()
@@ -143,7 +145,7 @@ async def check_prices():
     rows = cursor.fetchall()
     
     for item_id, user_id, url, old_title, old_price in rows:
-        _, new_price = await fetch_product_info(url)
+        new_price = await fetch_product_info(url)
         if new_price and new_price < old_price:
             cursor.execute("UPDATE tracked SET price = ? WHERE id = ?", (new_price, item_id))
             conn.commit()
