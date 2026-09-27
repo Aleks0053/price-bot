@@ -1,7 +1,5 @@
 import asyncio
 import logging
-import os
-import sqlite3
 import aiohttp
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types
@@ -15,24 +13,11 @@ BOT_TOKEN = "8750998872:AAGjsnuFlopHQrFrRGRJMrROyFuvQT_sl3o"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-def init_db():
-    conn = sqlite3.connect("prices.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS tracked (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            url TEXT,
-            title TEXT,
-            price REAL
-        )
-    """)
-    conn.commit()
-    conn.close()
+# Временное хранилище в памяти (вместо падающей SQLite на Render)
+# Структура: { user_id: [ { "title": "...", "price": 1499.0, "url": "..." }, ... ] }
+user_tracked_items = {}
 
-init_db()
-
-async def fetch_product_info(url):
+async def check_product_price(url):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
@@ -41,31 +26,41 @@ async def fetch_product_info(url):
         try:
             async with session.get(url, headers=headers, allow_redirects=True, timeout=15) as response:
                 if response.status != 200:
-                    return 1999.0
+                    return None
                 html = await response.text()
                 soup = BeautifulSoup(html, "html.parser")
                 
-                price = None
+                # Поиск цены через мета-тег
                 meta_price = soup.find("meta", property="og:price:amount")
                 if meta_price:
                     try:
-                        price = float(meta_price.get("content"))
+                        return float(meta_price.get("content"))
                     except:
                         pass
                 
-                return price if price else 1999.0
+                # Поиск цены по тексту с символом рубля
+                for span in soup.find_all(["span", "div"]):
+                    text = span.get_text(strip=True)
+                    if "₽" in text and len(text) < 15:
+                        clean_price = "".join(filter(str.isdigit, text))
+                        if clean_price and len(clean_price) <= 7:
+                            val = float(clean_price)
+                            if val > 50:
+                                return val
         except Exception as e:
-            logging.error(f"Ошибка при запросе страницы: {e}")
-            return 1999.0
+            logging.error(f"Ошибка проверки цены: {e}")
+        return None
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "👋 Привет! Бот готов к работе.\n\n"
-        "📌 **Команды:**\n"
-        "• `/track [Название] [Ссылка]` — добавить товар\n"
-        "• `/list` — список товаров\n"
-        "• `/clear` — удалить все отслеживаемые товары",
+        "👋 **Привет! Бот трекер цен запущен.**\n\n"
+        "📌 **Как добавлять товар:**\n"
+        "`/track [Название] [Цена] [Ссылка]`\n"
+        "*Пример:* `/track Джинсы 1599 https://ozon.ru/t/8MWfhfH`\n\n"
+        "📋 **Команды:**\n"
+        "• `/list` — посмотреть список товаров\n"
+        "• `/clear` — очистить список",
         parse_mode="Markdown"
     )
 
@@ -73,97 +68,104 @@ async def cmd_start(message: types.Message):
 async def cmd_track(message: types.Message):
     text_parts = message.text.split(maxsplit=1)
     if len(text_parts) < 2:
-        await message.answer("⚠️ Укажите название и ссылку!\nПример: `/track Джинсы https://ozon.ru/...`", parse_mode="Markdown")
+        await message.answer(
+            "⚠️ Неверный формат!\n"
+            "Используйте: `/track [Название] [Цена] [Ссылка]`\n"
+            "Пример: `/track Джинсы 1599 https://ozon.ru/...`",
+            parse_mode="Markdown"
+        )
         return
     
-    full_args = text_parts[1].strip()
-    url = ""
-    title_words = []
+    full_args = text_parts[1].strip().split()
     
-    for word in full_args.split():
+    # Ищем ссылку среди аргументов (начинается с http)
+    url = ""
+    url_index = -1
+    for i, word in enumerate(full_args):
         if word.startswith("http://") or word.startswith("https://"):
             url = word
-        else:
-            title_words.append(word)
+            url_index = i
+            break
             
-    if not url:
-        await message.answer("⚠️ Вы забыли указать ссылку на товар!")
+    if not url or url_index < 2:
+        await message.answer("⚠️ Обязательно укажите **название**, текущую **цену** (цифрой) и **ссылку**!")
         return
         
-    custom_title = " ".join(title_words) if title_words else "Товар с маркетплейса"
+    price_str = full_args[url_index - 1]
+    try:
+        price = float(price_str.replace(",", "."))
+    except ValueError:
+        await message.answer("⚠️ Цена должна быть числом! Пример: `1599` или `1499.50`", parse_mode="Markdown")
+        return
+        
+    title = " ".join(full_args[:url_index - 1])
     user_id = message.chat.id
     
-    await message.answer("⏳ Получаю данные о товаре...")
-    price = await fetch_product_info(url)
-    
-    conn = sqlite3.connect("prices.db")
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO tracked (user_id, url, title, price) VALUES (?, ?, ?, ?)", (user_id, url, custom_title, price))
-    conn.commit()
-    conn.close()
+    if user_id not in user_tracked_items:
+        user_tracked_items[user_id] = []
+        
+    user_tracked_items[user_id].append({
+        "title": title,
+        "price": price,
+        "url": url
+    })
     
     await message.answer(
-        f"✅ **Товар успешно добавлен!**\n\n"
-        f"📦 **Название:** {custom_title}\n"
-        f"💰 **Цена:** {price} руб.",
-        parse_mode="Markdown"
+        f"✅ **Товар успешно добавлен в отслеживание!**\n\n"
+        f"📦 **Название:** {title}\n"
+        f"💰 **Ваша начальная цена:** {price} руб.\n"
+        f"🔗 [Ссылка на товар]({url})",
+        parse_mode="Markdown",
+        disable_web_page_preview=True
     )
 
 @dp.message(Command("list"))
 async def cmd_list(message: types.Message):
     user_id = message.chat.id
-    conn = sqlite3.connect("prices.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT title, price, url FROM tracked WHERE user_id = ?", (user_id,))
-    rows = cursor.fetchall()
-    conn.close()
+    items = user_tracked_items.get(user_id, [])
     
-    if not rows:
+    if not items:
         await message.answer("📭 Ваш список отслеживания пуст.")
         return
     
     text = "📋 **Ваши отслеживаемые товары:**\n\n"
-    for i, (title, price, url) in enumerate(rows, 1):
-        text += f"{i}. **{title}**\n💰 {price} руб.\n🔗 [Ссылка]({url})\n\n"
-    
+    for i, item in enumerate(items, 1):
+        text += f"{i}. **{item['title']}**\n💰 {item['price']} руб.\n🔗 [Ссылка]({item['url']})\n\n"
+        
     await message.answer(text, parse_mode="Markdown", disable_web_page_preview=True)
 
 @dp.message(Command("clear"))
 async def cmd_clear(message: types.Message):
     user_id = message.chat.id
-    conn = sqlite3.connect("prices.db")
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM tracked WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+    if user_id in user_tracked_items:
+        user_tracked_items[user_id] = []
     await message.answer("🗑 Ваш список отслеживания полностью очищен!")
 
-async def check_prices():
-    conn = sqlite3.connect("prices.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, user_id, url, title, price FROM tracked")
-    rows = cursor.fetchall()
-    
-    for item_id, user_id, url, old_title, old_price in rows:
-        new_price = await fetch_product_info(url)
-        if new_price and new_price < old_price:
-            cursor.execute("UPDATE tracked SET price = ? WHERE id = ?", (new_price, item_id))
-            conn.commit()
-            await bot.send_message(
-                user_id,
-                f"🔥 **Снижение цены!**\n\n"
-                f"📦 **{old_title}**\n"
-                f"📉 Было: {old_price} руб.\n"
-                f"💰 Стало: **{new_price} руб.**\n"
-                f"🔗 [Перейти]({url})",
-                parse_mode="Markdown"
-            )
-        await asyncio.sleep(3)
-    conn.close()
+async def scheduled_price_check():
+    for user_id, items in user_tracked_items.items():
+        for item in items:
+            current_price = await check_product_price(item["url"])
+            if current_price and current_price < item["price"]:
+                old_price = item["price"]
+                item["price"] = current_price  # обновляем цену в памяти
+                try:
+                    await bot.send_message(
+                        user_id,
+                        f"🔥 **Цена снизилась!**\n\n"
+                        f"📦 **{item['title']}**\n"
+                        f"📉 Было: {old_price} руб.\n"
+                        f"💰 Стало: **{current_price} руб.**\n"
+                        f"🔗 [Перейти к товару]({item['url']})",
+                        parse_mode="Markdown",
+                        disable_web_page_preview=True
+                    )
+                except Exception as e:
+                    logging.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
+            await asyncio.sleep(2)
 
 async def main():
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(check_prices, "interval", hours=3)
+    scheduler.add_job(scheduled_price_check, "interval", hours=3)
     scheduler.start()
     await dp.start_polling(bot)
 
