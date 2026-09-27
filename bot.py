@@ -13,8 +13,7 @@ BOT_TOKEN = "8750998872:AAGjsnuFlopHQrFrRGRJMrROyFuvQT_sl3o"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Временное хранилище в памяти (вместо падающей SQLite на Render)
-# Структура: { user_id: [ { "title": "...", "price": 1499.0, "url": "..." }, ... ] }
+# Хранилище в оперативной памяти (надежно, не падает на Render)
 user_tracked_items = {}
 
 async def check_product_price(url):
@@ -30,7 +29,6 @@ async def check_product_price(url):
                 html = await response.text()
                 soup = BeautifulSoup(html, "html.parser")
                 
-                # Поиск цены через мета-тег
                 meta_price = soup.find("meta", property="og:price:amount")
                 if meta_price:
                     try:
@@ -38,7 +36,6 @@ async def check_product_price(url):
                     except:
                         pass
                 
-                # Поиск цены по тексту с символом рубля
                 for span in soup.find_all(["span", "div"]):
                     text = span.get_text(strip=True)
                     if "₽" in text and len(text) < 15:
@@ -56,8 +53,8 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "👋 **Привет! Бот трекер цен запущен.**\n\n"
         "📌 **Как добавлять товар:**\n"
-        "`/track [Название] [Цена] [Ссылка]`\n"
-        "*Пример:* `/track Джинсы 1599 https://ozon.ru/t/8MWfhfH`\n\n"
+        "`/track [Название товара] [Цена] [Ссылка]`\n"
+        "*Пример:* `/track Детский планшет 3402 https://ozon.ru/t/bTdsVMz`\n\n"
         "📋 **Команды:**\n"
         "• `/list` — посмотреть список товаров\n"
         "• `/clear` — очистить список",
@@ -70,35 +67,37 @@ async def cmd_track(message: types.Message):
     if len(text_parts) < 2:
         await message.answer(
             "⚠️ Неверный формат!\n"
-            "Используйте: `/track [Название] [Цена] [Ссылка]`\n"
-            "Пример: `/track Джинсы 1599 https://ozon.ru/...`",
+            "Используйте: `/track [Название товара] [Цена] [Ссылка]`",
             parse_mode="Markdown"
         )
         return
     
-    full_args = text_parts[1].strip().split()
+    args_text = text_parts[1].strip()
+    words = args_text.split()
     
-    # Ищем ссылку среди аргументов (начинается с http)
+    # Ищем ссылку (начинается с http)
     url = ""
     url_index = -1
-    for i, word in enumerate(full_args):
+    for i, word in enumerate(words):
         if word.startswith("http://") or word.startswith("https://"):
             url = word
             url_index = i
             break
             
     if not url or url_index < 2:
-        await message.answer("⚠️ Обязательно укажите **название**, текущую **цену** (цифрой) и **ссылку**!")
+        await message.answer("⚠️ Обязательно укажите название, цену и ссылку в конце!")
         return
         
-    price_str = full_args[url_index - 1]
+    # Предпоследнее слово перед ссылкой — это цена
+    price_str = words[url_index - 1].replace("руб.", "").replace("₽", "").strip()
     try:
         price = float(price_str.replace(",", "."))
     except ValueError:
-        await message.answer("⚠️ Цена должна быть числом! Пример: `1599` или `1499.50`", parse_mode="Markdown")
+        await message.answer(f"⚠️ Не удалось распознать цену (`{price_str}`). Убедитесь, что перед ссылкой идет число, например: `3402`", parse_mode="Markdown")
         return
         
-    title = " ".join(full_args[:url_index - 1])
+    # Всё, что до цены — это название товара
+    title = " ".join(words[:url_index - 1])
     user_id = message.chat.id
     
     if user_id not in user_tracked_items:
@@ -111,9 +110,9 @@ async def cmd_track(message: types.Message):
     })
     
     await message.answer(
-        f"✅ **Товар успешно добавлен в отслеживание!**\n\n"
+        f"✅ **Товар успешно добавлен!**\n\n"
         f"📦 **Название:** {title}\n"
-        f"💰 **Ваша начальная цена:** {price} руб.\n"
+        f"💰 **Цена:** {price} руб.\n"
         f"🔗 [Ссылка на товар]({url})",
         parse_mode="Markdown",
         disable_web_page_preview=True
@@ -147,7 +146,7 @@ async def scheduled_price_check():
             current_price = await check_product_price(item["url"])
             if current_price and current_price < item["price"]:
                 old_price = item["price"]
-                item["price"] = current_price  # обновляем цену в памяти
+                item["price"] = current_price
                 try:
                     await bot.send_message(
                         user_id,
@@ -160,7 +159,7 @@ async def scheduled_price_check():
                         disable_web_page_preview=True
                     )
                 except Exception as e:
-                    logging.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
+                    logging.error(f"Ошибка уведомления: {e}")
             await asyncio.sleep(2)
 
 async def main():
