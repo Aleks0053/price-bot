@@ -1,275 +1,279 @@
+"""
+Telegram-бот мониторинга цен.
+Каждые 3 часа проверяет ссылки и присылает уведомление, если цена упала.
+
+Команды:
+  /add <ссылка> [css-селектор]  - добавить товар (селектор нужен, только если цена не нашлась сама)
+  /list                          - список отслеживаемых товаров
+  /remove <id>                   - удалить товар
+  /check                         - проверить всё прямо сейчас
+"""
 import asyncio
+import json
 import logging
 import os
-import aiohttp
+import re
+import sqlite3
+from urllib.parse import urlparse
+
+import requests
 from bs4 import BeautifulSoup
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from aiohttp import web
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# Настройка логирования, чтобы видеть все ошибки в консоли Render
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+BOT_TOKEN = os.environ["8750998872:AAGjsnuFlopHQrFrRGRJMrROyFuvQT_sl3o"]
+CHECK_INTERVAL = 3 * 60 * 60  # 3 часа, в секундах
+DB_PATH = os.environ.get("DB_PATH", "prices.db")
 
-BOT_TOKEN = "8750998872:AAGjsnuFlopHQrFrRGRJMrROyFuvQT_sl3o"
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+}
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("price-bot")
 
-# База данных в оперативной памяти
-user_tracked_items = {}
 
-async def check_product_price(url):
-    """Надежный парсер цен для Ozon, Wildberries и других сайтов"""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive"
-    }
-    
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url, headers=headers, allow_redirects=True, timeout=20) as response:
-                if response.status != 200:
-                    logging.warning(f"Сайт {url} вернул статус: {response.status}")
-                    return None
-                
-                html = await response.text()
-                soup = BeautifulSoup(html, "html.parser")
-                
-                # 1. Пробуем найти через OpenGraph мета-теги (Ozon часто их использует)
-                meta_price = soup.find("meta", property="og:price:amount") or soup.find("meta", {"itemprop": "price"})
-                if meta_price and meta_price.get("content"):
-                    try:
-                        clean = "".join(filter(lambda c: c.isdigit() or c == '.', meta_price.get("content")))
-                        val = float(clean)
-                        if val > 10:
-                            return val
-                    except Exception:
-                        pass
-                
-                # 2. Специфичный поиск для Wildberries
-                if "wildberries.ru" in url:
-                    for tag in ["ins", "span"]:
-                        found = soup.find(tag, class_=lambda c: c and ("price" in c.lower() or "cost" in c.lower()))
-                        if found:
-                            digits = "".join(filter(str.isdigit, found.get_text()))
-                            if digits and len(digits) <= 7:
-                                val = float(digits)
-                                if val > 10:
-                                    return val
+# ---------- БД ----------
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-                # 3. Универсальный поиск по ключевым элементам и тексту с символом рубля
-                for tag in soup.find_all(["span", "div", "p", "price"]):
-                    text = tag.get_text(strip=True)
-                    if ("₽" in text or "руб" in text.lower()) and len(text) < 25:
-                        digits = "".join(filter(str.isdigit, text))
-                        if digits and len(digits) <= 7:
-                            try:
-                                val = float(digits)
-                                if val > 50: # Отсекаем мелкие копейки/рейтинги
-                                    return val
-                            except ValueError:
-                                continue
-                                
-        except asyncio.TimeoutError:
-            logging.error(f"Таймаут при запросе к сайту: {url}")
-        except Exception as e:
-            logging.error(f"Ошибка парсинга {url}: {e}")
-            
+
+def init_db():
+    with db() as c:
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                url TEXT NOT NULL,
+                selector TEXT,
+                title TEXT,
+                last_price REAL,
+                min_price REAL
+            )"""
+        )
+
+
+# ---------- Парсинг цены ----------
+def parse_price(text: str):
+    text = text.replace("\xa0", " ").replace("\u202f", " ")
+    m = re.search(r"\d[\d\s.,]*", text)
+    if not m:
+        return None
+    num = m.group(0).strip().replace(" ", "").rstrip(".,")
+    if "," in num and "." in num:
+        if num.rfind(",") > num.rfind("."):
+            num = num.replace(".", "").replace(",", ".")
+        else:
+            num = num.replace(",", "")
+    elif "," in num:
+        head, _, tail = num.rpartition(",")
+        num = head.replace(",", "") + "." + tail if len(tail) <= 2 else num.replace(",", "")
+    elif "." in num:
+        head, _, tail = num.rpartition(".")
+        if len(tail) == 3 and head:
+            num = num.replace(".", "")
+    try:
+        return float(num)
+    except ValueError:
         return None
 
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    await message.answer(
-        "🤖 **Бот-трекер цен полностью перезапущен и готов к работе!**\n\n"
-        "📌 **Как добавить товар:**\n"
-        "`/track [Название товара] [Цена] [Ссылка]`\n"
-        "*Пример:* `/track Детский планшет 3402 https://ozon.ru/t/bTdsVMz`\n\n"
-        "📋 **Команды управления:**\n"
-        "• `/list` — список товаров с кнопками\n"
-        "• `/check` — проверить цены прямо сейчас\n"
-        "• `/remove [номер]` — удалить товар\n"
-        "• `/clear` — очистить список",
-        parse_mode="Markdown"
+
+def _walk(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _walk(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk(v)
+
+
+def _price_from_jsonld(soup):
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string or "")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        for node in _walk(data):
+            offers = node.get("offers")
+            if not offers:
+                continue
+            for offer in offers if isinstance(offers, list) else [offers]:
+                if not isinstance(offer, dict):
+                    continue
+                for key in ("price", "lowPrice"):
+                    if key in offer:
+                        p = parse_price(str(offer[key]))
+                        if p:
+                            return p
+    return None
+
+
+def _price_from_meta(soup):
+    for attrs in (
+        {"property": "product:price:amount"},
+        {"property": "og:price:amount"},
+        {"itemprop": "price"},
+    ):
+        tag = soup.find(attrs=attrs)
+        if tag:
+            p = parse_price(tag.get("content") or tag.get_text())
+            if p:
+                return p
+    return None
+
+
+def fetch_price(url: str, selector: str | None):
+    """Возвращает (цена, название). Блокирующая функция - вызывать через to_thread."""
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    og = soup.find("meta", property="og:title")
+    title = (og.get("content") if og else None) or (soup.title.string.strip() if soup.title and soup.title.string else None)
+    title = (title or urlparse(url).netloc)[:120]
+
+    price = None
+    if selector:
+        el = soup.select_one(selector)
+        if el:
+            price = parse_price(el.get("content") or el.get_text())
+    else:
+        price = _price_from_jsonld(soup) or _price_from_meta(soup)
+    return price, title
+
+
+def fmt(p: float) -> str:
+    return f"{p:,.2f}".replace(",", " ").rstrip("0").rstrip(".")
+
+
+# ---------- Команды ----------
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привет! Я слежу за ценами и пишу, когда они падают (проверка каждые 3 часа).\n\n"
+        "/add <ссылка> [css-селектор] - добавить товар\n"
+        "/list - мои товары\n"
+        "/remove <id> - удалить\n"
+        "/check - проверить сейчас"
     )
 
-@dp.message(Command("track"))
-async def cmd_track(message: types.Message):
+
+async def add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text("Использование: /add <ссылка> [css-селектор]")
+        return
+    url = ctx.args[0]
+    selector = " ".join(ctx.args[1:]) or None
+    if not urlparse(url).scheme.startswith("http"):
+        await update.message.reply_text("Нужна полная ссылка, начинающаяся с http:// или https://")
+        return
+
+    await update.message.reply_text("Проверяю страницу...")
     try:
-        text_parts = message.text.split(maxsplit=1)
-        if len(text_parts) < 2:
-            await message.answer("⚠️ Неверный формат! Используйте: `/track [Название] [Цена] [Ссылка]`", parse_mode="Markdown")
-            return
-        
-        args_text = text_parts[1].strip()
-        words = args_text.split()
-        
-        url = ""
-        url_index = -1
-        for i, word in enumerate(words):
-            if word.startswith("http://") or word.startswith("https://"):
-                url = word
-                url_index = i
-                break
-                
-        if not url or url_index < 2:
-            await message.answer("⚠️ Обязательно укажите название, цену и рабочую ссылку в самом конце!")
-            return
-            
-        price_str = words[url_index - 1].replace("руб.", "").replace("₽", "").strip()
-        price = float(price_str.replace(",", "."))
-        
-        title = " ".join(words[:url_index - 1])
-        user_id = message.chat.id
-        
-        if user_id not in user_tracked_items:
-            user_tracked_items[user_id] = []
-            
-        user_tracked_items[user_id].append({
-            "title": title,
-            "price": price,
-            "url": url
-        })
-        
-        await message.answer(
-            f"✅ **Товар успешно добавлен в отслеживание!**\n\n"
-            f"📦 **Название:** {title}\n"
-            f"💰 **Целевая цена:** {price} руб.\n"
-            f"🔗 [Ссылка на товар]({url})",
-            parse_mode="Markdown",
-            disable_web_page_preview=True
-        )
+        price, title = await asyncio.to_thread(fetch_price, url, selector)
     except Exception as e:
-        logging.error(f"Ошибка в команде track: {e}")
-        await message.answer("⚠️ Ошибка добавления! Убедитесь, что цена — это просто число перед ссылкой.")
-
-@dp.message(Command("list"))
-async def cmd_list(message: types.Message):
-    user_id = message.chat.id
-    items = user_tracked_items.get(user_id, [])
-    
-    if not items:
-        await message.answer("📭 Ваш список отслеживания пуст.")
+        await update.message.reply_text(f"Не удалось открыть страницу: {e}")
         return
-    
-    for i, item in enumerate(items, 1):
-        builder = InlineKeyboardBuilder()
-        builder.button(text="🔗 Открыть", url=item['url'])
-        builder.button(text="❌ Удалить", callback_data=f"del_{i-1}")
-        builder.adjust(2)
-        
-        text = f"📦 **Товар #{i}:** {item['title']}\n💰 **Цель:** {item['price']} руб."
-        await message.answer(text, parse_mode="Markdown", reply_markup=builder.as_markup())
-
-@dp.callback_query(lambda c: c.data.startswith("del_"))
-async def process_delete_callback(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    index = int(callback.data.split("_")[1])
-    
-    if user_id in user_tracked_items and 0 <= index < len(user_tracked_items[user_id]):
-        removed = user_tracked_items[user_id].pop(index)
-        await callback.message.edit_text(f"🗑 Удалено: **{removed['title']}**", parse_mode="Markdown")
-    else:
-        await callback.answer("Товар уже удален.", show_alert=True)
-
-@dp.message(Command("remove"))
-async def cmd_remove(message: types.Message):
-    parts = message.text.split()
-    user_id = message.chat.id
-    if len(parts) < 2 or not parts[1].isdigit():
-        await message.answer("⚠️ Укажите номер. Пример: `/remove 1`", parse_mode="Markdown")
+    if price is None:
+        await update.message.reply_text(
+            "Цену найти не удалось. Пришли CSS-селектор элемента с ценой:\n"
+            "/add <ссылка> .price\n"
+            "(в браузере: ПКМ на цене → «Просмотреть код» → Copy → Copy selector)"
+        )
         return
-        
-    index = int(parts[1]) - 1
-    items = user_tracked_items.get(user_id, [])
-    if 0 <= index < len(items):
-        removed = items.pop(index)
-        await message.answer(f"🗑 Удалено: **{removed['title']}**", parse_mode="Markdown")
-    else:
-        await message.answer("⚠️ Товар не найден. Проверьте `/list`.", parse_mode="Markdown")
 
-@dp.message(Command("check"))
-async def cmd_check(message: types.Message):
-    user_id = message.chat.id
-    items = user_tracked_items.get(user_id, [])
-    if not items:
-        await message.answer("📭 Список пуст.")
+    with db() as c:
+        cur = c.execute(
+            "INSERT INTO items (chat_id, url, selector, title, last_price, min_price) VALUES (?,?,?,?,?,?)",
+            (update.effective_chat.id, url, selector, title, price, price),
+        )
+    await update.message.reply_text(f"✅ Добавлено #{cur.lastrowid}\n{title}\nТекущая цена: {fmt(price)}")
+
+
+async def list_items(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    with db() as c:
+        rows = c.execute("SELECT * FROM items WHERE chat_id=?", (update.effective_chat.id,)).fetchall()
+    if not rows:
+        await update.message.reply_text("Список пуст. Добавь товар через /add")
         return
-        
-    status_msg = await message.answer("🔍 Проверяю актуальные цены на сайтах...")
-    
-    report = "📊 **Результаты проверки цен:**\n\n"
-    for i, item in enumerate(items, 1):
-        current_price = await check_product_price(item["url"])
-        if current_price:
-            if current_price < item["price"]:
-                report += f"{i}. **{item['title']}**\n🔥 Упала! Сейчас: **{current_price} руб.** (Цель была: {item['price']})\n\n"
-            else:
-                report += f"{i}. **{item['title']}**\n💰 Текущая: {current_price} руб. (Цель: {item['price']})\n\n"
-        else:
-            report += f"{i}. **{item['title']}**\n⚠️ Сайт заблокировал запрос или цена скрыта.\n\n"
-        await asyncio.sleep(1.5)
-        
-    await bot.edit_message_text(report, chat_id=message.chat.id, message_id=status_msg.message_id, parse_mode="Markdown", disable_web_page_preview=True)
-
-@dp.message(Command("clear"))
-async def cmd_clear(message: types.Message):
-    user_id = message.chat.id
-    if user_id in user_tracked_items:
-        user_tracked_items[user_id] = []
-    await message.answer("🗑 Список очищен!")
-
-async def scheduled_price_check():
-    """Фоновая проверка каждые 3 часа"""
-    while True:
-        await asyncio.sleep(10800) # 3 часа
-        for user_id, items in list(user_tracked_items.items()):
-            for item in items:
-                try:
-                    current_price = await check_product_price(item["url"])
-                    if current_price and current_price < item["price"]:
-                        old_price = item["price"]
-                        item["price"] = current_price
-                        builder = InlineKeyboardBuilder()
-                        builder.button(text="🔗 Купить", url=item['url'])
-                        
-                        await bot.send_message(
-                            user_id,
-                            f"🔥 **Цена снизилась!**\n\n"
-                            f"📦 **{item['title']}**\n"
-                            f"📉 Было: {old_price} руб.\n"
-                            f"💰 Стало: **{current_price} руб.**",
-                            parse_message="Markdown",
-                            reply_markup=builder.as_markup()
-                        )
-                except Exception as e:
-                    logging.error(f"Ошибка в фоновой проверке: {e}")
-                await asyncio.sleep(3)
-
-async def handle(request):
-    return web.Response(text="Bot is running!")
-
-async def web_server():
-    app = web.Application()
-    app.router.add_get("/", handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-
-async def main():
-    # Запускаем фоновый цикл проверки цен отдельно, чтобы он не падал
-    asyncio.create_task(scheduled_price_check())
-    
-    await asyncio.gather(
-        web_server(),
-        dp.start_polling(bot)
+    text = "\n\n".join(
+        f"#{r['id']} {r['title']}\nСейчас: {fmt(r['last_price'])} | минимум: {fmt(r['min_price'])}\n{r['url']}"
+        for r in rows
     )
+    await update.message.reply_text(text, disable_web_page_preview=True)
+
+
+async def remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args or not ctx.args[0].isdigit():
+        await update.message.reply_text("Использование: /remove <id>")
+        return
+    with db() as c:
+        cur = c.execute("DELETE FROM items WHERE id=? AND chat_id=?", (int(ctx.args[0]), update.effective_chat.id))
+    await update.message.reply_text("Удалено 🗑" if cur.rowcount else "Товар с таким id не найден")
+
+
+# ---------- Проверка цен ----------
+async def check_prices(context: ContextTypes.DEFAULT_TYPE, only_chat: int | None = None):
+    with db() as c:
+        if only_chat:
+            rows = c.execute("SELECT * FROM items WHERE chat_id=?", (only_chat,)).fetchall()
+        else:
+            rows = c.execute("SELECT * FROM items").fetchall()
+
+    for r in rows:
+        try:
+            price, _ = await asyncio.to_thread(fetch_price, r["url"], r["selector"])
+        except Exception as e:
+            log.warning("Ошибка для #%s: %s", r["id"], e)
+            continue
+        if price is None:
+            log.warning("Цена не найдена для #%s", r["id"])
+            continue
+
+        old = r["last_price"]
+        new_min = min(r["min_price"], price)
+        with db() as c:
+            c.execute("UPDATE items SET last_price=?, min_price=? WHERE id=?", (price, new_min, r["id"]))
+
+        if price < old:
+            pct = (old - price) / old * 100
+            record = "\n🔥 Это новый минимум!" if price < r["min_price"] else ""
+            await context.bot.send_message(
+                r["chat_id"],
+                f"📉 Цена упала!\n{r['title']}\n{fmt(old)} → {fmt(price)} (−{pct:.1f}%){record}\n{r['url']}",
+            )
+        await asyncio.sleep(2)  # пауза между запросами, чтобы не банили
+
+
+async def scheduled_check(context: ContextTypes.DEFAULT_TYPE):
+    log.info("Плановая проверка цен")
+    await check_prices(context)
+
+
+async def manual_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Проверяю все товары...")
+    await check_prices(ctx, only_chat=update.effective_chat.id)
+    await update.message.reply_text("Готово. Если что-то подешевело, я уже написал выше.")
+
+
+def main():
+    init_db()
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler(["start", "help"], start))
+    app.add_handler(CommandHandler("add", add))
+    app.add_handler(CommandHandler("list", list_items))
+    app.add_handler(CommandHandler("remove", remove))
+    app.add_handler(CommandHandler("check", manual_check))
+    app.job_queue.run_repeating(scheduled_check, interval=CHECK_INTERVAL, first=60)
+    log.info("Бот запущен")
+    app.run_polling()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
